@@ -56,8 +56,19 @@ typedef struct broadcaster_impl {
 static void pad_added_handler(GstElement *src, GstPad *new_pad, broadcaster_impl *data);
 
 // Helper functions (added not as much for re-usability as for making the code more readable
+
+// Creates all pipeline elements and configures them
 gboolean twitch_broadcaster_create_elements(twitch_broadcaster *self, Config *config);
+
+// Add all created elements to the pipeline and links static part of the pipeline
 gboolean twitch_broadcaster_configure_pipeline(twitch_broadcaster *self, Config *config);
+
+// Wires new video track into the pipeline dynamically
+gboolean twitch_broadcaster_wire_new_video_track(broadcaster_impl *self, GstPad *new_pad);
+
+// Wires new audio track into the pipeline dynamically
+gboolean twitch_broadcaster_wire_new_audio_track(broadcaster_impl *self, GstPad *new_pad);
+
 
 // API implementation
 
@@ -155,18 +166,13 @@ void twitch_broadcaster_destroy(twitch_broadcaster *self) {
 }
 
 static void pad_added_handler (GstElement *src, GstPad *new_pad, broadcaster_impl *data) {
-    GstPadTemplate *mixer_sink_pad_template = gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS(data->video_mixer), "sink_%u");
     GstPadTemplate *audio_mixer_sink_pad_template = gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS(data->audio_mixer), "sink_%u");
 
     GstCaps *new_pad_caps = NULL;
     GstStructure *new_pad_struct = NULL;
-    GstPad *mixer_sink_pad = NULL;
     GstPad *audio_mixer_sink_pad = NULL;
     const gchar *new_pad_type = NULL;
     GstPadLinkReturn ret;
-
-    GstElement *video_capsfilter = NULL;
-    GstCaps *size_caps = NULL;
 
     g_print ("Received new pad '%s' from '%s':\n", GST_PAD_NAME (new_pad), GST_ELEMENT_NAME (src));
 
@@ -175,161 +181,14 @@ static void pad_added_handler (GstElement *src, GstPad *new_pad, broadcaster_imp
     new_pad_type = gst_structure_get_name (new_pad_struct);
 
     g_mutex_lock(&data->lock);
-
     if (g_str_has_prefix (new_pad_type, "video/x-raw")) {
-        GstElement *video_scaler = NULL;
-        if (data->linked_pads == MAX_SOURCES) {
-            // assume sources have only one video track for simplicity.
-            g_print ("We are already linked. Ignoring.\n");
-            goto exit;
-        }
-        // time to link pads decodebin -> scaler (keeping aspect ratio) -> capsfilter -> video mixer
-
-        video_scaler = gst_element_factory_make("videoscale", NULL);
-        if (!video_scaler) {
-            g_printerr("Failed to create scaler.\n");
-            goto exit;
-        }
-        video_capsfilter = gst_element_factory_make("capsfilter", NULL);
-        if (!video_capsfilter) {
-            g_printerr("Failed to create capsfilter in front of mixer.\n");
-            gst_object_unref(video_scaler);
-            goto exit;
-        }
-        g_object_set(video_scaler, "add-borders", TRUE, NULL);
-
-        size_caps = gst_caps_from_string(SOURCE_SIZE_CAPS);
-        g_object_set (video_capsfilter, "caps", size_caps, NULL);
-        gst_caps_unref(size_caps);
-
-        gst_bin_add_many(GST_BIN(data->pipeline), video_scaler, video_capsfilter, NULL);
-
-        if (!gst_element_sync_state_with_parent(video_scaler) || !gst_element_sync_state_with_parent(video_capsfilter)) {
-            g_printerr("Failed to sync state of a video scaler or capsfilter with the pipeline's state\n");
-            goto exit;
-        }
-
-        // Requesting new sink pad from mixer
-        mixer_sink_pad = gst_element_request_pad (data->video_mixer, mixer_sink_pad_template, NULL, NULL);
-        if (!mixer_sink_pad) {
-            g_printerr("failed to get mixer sink pad\n");
-            goto exit;
-        }
-        g_object_set(mixer_sink_pad, "xpos", data->linked_pads * 640, NULL);
-        g_object_set(mixer_sink_pad, "ypos", 0, NULL);
-        g_object_set(mixer_sink_pad, "width", 640, NULL);
-        g_object_set(mixer_sink_pad, "height", 1080, NULL);
-
-
-        GstPad *scaler_sink_pad = gst_element_get_static_pad(video_scaler, "sink");
-        GstPad *scaler_src_pad = gst_element_get_static_pad(video_scaler, "src");
-
-        // linking decodebin and scaler
-        ret = gst_pad_link(new_pad, scaler_sink_pad);
-        if (GST_PAD_LINK_FAILED (ret)) {
-            gst_object_unref(scaler_src_pad);
-            gst_object_unref(scaler_sink_pad);
-            g_printerr("Failed to link decodebin and scaler\n");
-            goto exit;
-        }
-
-        // linking scaler and capsfilter
-        if (!gst_element_link(video_scaler, video_capsfilter)) {
-            gst_object_unref(scaler_src_pad);
-            gst_object_unref(scaler_sink_pad);
-            g_printerr("Failed to link scaler and capsfilter\n");
-            goto exit;
-        }
-
-        // linking capsfilter and mixer
-        GstPad *capsfilter_src_pad = gst_element_get_static_pad(video_capsfilter, "src");
-        ret = gst_pad_link(capsfilter_src_pad, mixer_sink_pad);
-
-        gst_object_unref(capsfilter_src_pad);
-        gst_object_unref(scaler_sink_pad);
-
-        if (GST_PAD_LINK_FAILED (ret)) {
-            g_printerr("Faild to link capsfilter and mixer\n");
-            goto exit;
-        }
-        data->linked_pads++;
+        twitch_broadcaster_wire_new_video_track(data, new_pad);
 
     } else if (g_str_has_prefix (new_pad_type, "audio/x-raw")) {
-        //TODO: remove limit
-        if (data->linked_audio_pads == MAX_SOURCES) {
-            // assume sources have only one audio track for simplicity.
-            g_print ("We are already linked. Ignoring.\n");
-            goto exit;
-        }
-        // dyn. part
-        GstCaps *caps_to_use;
-        GstElement *audio_convert, *audio_resample, *audio_capsfilter;
-
-        caps_to_use = gst_caps_from_string(AUDIO_CAPS);
-        audio_mixer_sink_pad = gst_element_request_pad (data->audio_mixer, audio_mixer_sink_pad_template, NULL, NULL);
-        if (!audio_mixer_sink_pad) {
-            g_printerr("failed to get mixer sink pad");
-            goto exit;
-        }
-
-        if (!gst_caps_is_equal(caps_to_use, new_pad_caps)) {
-            // convert audio
-            audio_resample = gst_element_factory_make("audioresample", NULL);
-            audio_convert = gst_element_factory_make("audioconvert", NULL);
-            audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
-            g_object_set(audio_capsfilter, "caps", caps_to_use, NULL);
-            gst_bin_add_many(GST_BIN(data->pipeline), audio_resample, audio_convert, audio_capsfilter, NULL);
-
-            if (!gst_element_link_many(audio_resample, audio_convert, audio_capsfilter, NULL)) {
-                g_printerr("Failed to link audio chain");
-                goto exit;
-            }
-            if (!gst_element_sync_state_with_parent(audio_resample) ||
-                !gst_element_sync_state_with_parent(audio_convert) ||
-                !gst_element_sync_state_with_parent(audio_capsfilter)) {
-                g_printerr("Failed to sync new audio el. state with parent");
-                goto exit;
-            }
-            // now link decodebin -> resample && capsfilter -> mixer
-            GstPad *resample_sink_pad = gst_element_get_static_pad (audio_resample, "sink");
-            ret = gst_pad_link(new_pad, resample_sink_pad);
-            gst_object_unref(resample_sink_pad);
-            if (GST_PAD_LINK_FAILED (ret)) {
-                g_printerr("Failed to link decodebin and resampler");
-                goto exit;
-            }
-            GstPad *caps_filter_src_pad = gst_element_get_static_pad (audio_capsfilter, "src");
-            ret = gst_pad_link(caps_filter_src_pad, audio_mixer_sink_pad);
-            gst_object_unref(caps_filter_src_pad);
-            if (GST_PAD_LINK_FAILED (ret)) {
-                g_printerr ("Failed to link capsfilter and mixer");
-            } else {
-                g_print ("Link succeeded (type '%s').\n", new_pad_type);
-                data->linked_audio_pads++;
-            }
-        } else {
-            // pass through link directly to mixer
-            ret = gst_pad_link(new_pad, audio_mixer_sink_pad);
-            if (GST_PAD_LINK_FAILED (ret)) {
-                g_print ("Type is '%s' but link failed.\n", new_pad_type);
-            } else {
-                g_print ("Link succeeded (type '%s').\n", new_pad_type);
-                data->linked_audio_pads++;
-            }
-        }
+        twitch_broadcaster_wire_new_audio_track(data, new_pad);
     }
-
-    exit:
-    /* Unreference the new pad's caps, if we got them */
-    if (new_pad_caps != NULL)
-        gst_caps_unref (new_pad_caps);
-
-    /* Unreference the sink pad */
-    if (mixer_sink_pad) {
-        gst_object_unref(mixer_sink_pad);
-    }
-    if (audio_mixer_sink_pad) {
-        gst_object_unref(audio_mixer_sink_pad);
+    if (new_pad_caps != NULL) {
+        gst_caps_unref(new_pad_caps);
     }
     g_mutex_unlock(&data->lock);
 }
@@ -422,5 +281,182 @@ gboolean twitch_broadcaster_configure_pipeline(twitch_broadcaster *self, Config 
     g_signal_connect(self->impl->source, "pad-added", G_CALLBACK(pad_added_handler), self->impl);
     g_signal_connect(self->impl->source1, "pad-added", G_CALLBACK(pad_added_handler), self->impl);
     g_signal_connect(self->impl->source2, "pad-added", G_CALLBACK(pad_added_handler), self->impl);
+    return TRUE;
+}
+
+gboolean twitch_broadcaster_wire_new_video_track(broadcaster_impl *self, GstPad *new_pad) {
+    // Scaler to resize the signal but keep aspect ratio
+    GstElement *video_scaler = NULL;
+    GstElement *video_capsfilter = NULL;
+
+    if (self->linked_pads == MAX_SOURCES) {
+        // assume sources have only one video track for simplicity.
+        g_print("We are already linked. Ignoring.\n");
+        goto exit;
+    }
+    // time to link pads decodebin -> scaler (keeping aspect ratio) -> capsfilter -> video mixer
+    video_scaler = gst_element_factory_make("videoscale", NULL);
+    if (!video_scaler) {
+        g_printerr("Failed to create scaler.\n");
+        goto exit;
+    }
+    video_capsfilter = gst_element_factory_make("capsfilter", NULL);
+    if (!video_capsfilter) {
+        g_printerr("Failed to create capsfilter in front of mixer.\n");
+        gst_object_unref(video_scaler);
+        goto exit;
+    }
+    // keep aspect ratio
+    g_object_set(video_scaler, "add-borders", TRUE, NULL);
+
+    // make sure each source takes 1/3 of the output on the horizontal line
+    GstCaps *size_caps = gst_caps_from_string(SOURCE_SIZE_CAPS);
+    g_object_set (video_capsfilter, "caps", size_caps, NULL);
+    gst_caps_unref(size_caps);
+
+    gst_bin_add_many(GST_BIN(self->pipeline), video_scaler, video_capsfilter, NULL);
+
+    if (!gst_element_sync_state_with_parent(video_scaler) ||
+        !gst_element_sync_state_with_parent(video_capsfilter)) {
+        g_printerr("Failed to sync state of a video scaler or capsfilter with the pipeline's state\n");
+        gst_object_unref(video_scaler);
+        gst_object_unref(video_capsfilter);
+        goto exit;
+    }
+
+    // Requesting new sink pad from mixer
+    GstPadTemplate *mixer_sink_pad_template = gst_element_class_get_pad_template(
+            GST_ELEMENT_GET_CLASS(self->video_mixer),
+            "sink_%u");
+    GstPad *mixer_sink_pad =gst_element_request_pad(
+            self->video_mixer,
+            mixer_sink_pad_template,
+            NULL, NULL);
+    if (!mixer_sink_pad) {
+        g_printerr("failed to get mixer sink pad\n");
+        goto exit;
+    }
+    // Configure position and size in the output stream
+    g_object_set(mixer_sink_pad, "xpos", self->linked_pads * 640, NULL);
+    g_object_set(mixer_sink_pad, "ypos", 0, NULL);
+    g_object_set(mixer_sink_pad, "width", 640, NULL);
+    g_object_set(mixer_sink_pad, "height", 1080, NULL);
+
+
+    GstPad *scaler_sink_pad = gst_element_get_static_pad(video_scaler, "sink");
+    GstPad *scaler_src_pad = gst_element_get_static_pad(video_scaler, "src");
+
+    // linking decodebin and scaler
+    GstPadLinkReturn ret = gst_pad_link(new_pad, scaler_sink_pad);
+    if (GST_PAD_LINK_FAILED (ret)) {
+        gst_object_unref(scaler_src_pad);
+        gst_object_unref(scaler_sink_pad);
+        g_printerr("Failed to link decodebin and scaler\n");
+        goto exit;
+    }
+
+    // linking scaler and capsfilter
+    if (!gst_element_link(video_scaler, video_capsfilter)) {
+        gst_object_unref(scaler_src_pad);
+        gst_object_unref(scaler_sink_pad);
+        g_printerr("Failed to link scaler and capsfilter\n");
+        goto exit;
+    }
+
+    // linking capsfilter and mixer
+    GstPad *capsfilter_src_pad = gst_element_get_static_pad(video_capsfilter, "src");
+    ret = gst_pad_link(capsfilter_src_pad, mixer_sink_pad);
+
+    gst_object_unref(capsfilter_src_pad);
+    gst_object_unref(scaler_sink_pad);
+
+    if (GST_PAD_LINK_FAILED (ret)) {
+        g_printerr("Faild to link capsfilter and mixer\n");
+        goto exit;
+    }
+    self->linked_pads++;
+    exit:
+    /* Unreference the sink pad */
+    if (mixer_sink_pad) {
+        gst_object_unref(mixer_sink_pad);
+    }
+    return TRUE;
+}
+
+gboolean twitch_broadcaster_wire_new_audio_track(broadcaster_impl *self, GstPad *new_pad) {
+    GstPadTemplate *audio_mixer_sink_pad_template = gst_element_class_get_pad_template (
+            GST_ELEMENT_GET_CLASS(self->audio_mixer),
+            "sink_%u");
+    GstCaps *new_pad_caps = gst_pad_get_current_caps(new_pad);
+    //TODO: remove limit - assume one track per source for simplicity
+    if (self->linked_audio_pads == MAX_SOURCES) {
+        // assume sources have only one audio track for simplicity.
+        g_print("We are already linked. Ignoring.\n");
+        goto exit;
+    }
+    // dyn. part
+    GstCaps *caps_to_use = NULL;
+    GstElement *audio_convert, *audio_resample, *audio_capsfilter;
+
+    caps_to_use = gst_caps_from_string(AUDIO_CAPS);
+    GstPad *audio_mixer_sink_pad = gst_element_request_pad(
+            self->audio_mixer, audio_mixer_sink_pad_template, NULL, NULL);
+    if (!audio_mixer_sink_pad) {
+        g_printerr("failed to get mixer sink pad!\n");
+        goto exit;
+    }
+
+    if (!gst_caps_is_equal(caps_to_use, new_pad_caps)) {
+        // convert audio
+        audio_resample = gst_element_factory_make("audioresample", NULL);
+        audio_convert = gst_element_factory_make("audioconvert", NULL);
+        audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
+        g_object_set(audio_capsfilter, "caps", caps_to_use, NULL);
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                audio_resample,
+                audio_convert,
+                audio_capsfilter, NULL);
+
+        if (!gst_element_link_many(audio_resample, audio_convert, audio_capsfilter, NULL)) {
+            g_printerr("Failed to link audio chain!\n");
+            goto exit;
+        }
+        if (!gst_element_sync_state_with_parent(audio_resample) ||
+            !gst_element_sync_state_with_parent(audio_convert) ||
+            !gst_element_sync_state_with_parent(audio_capsfilter)) {
+            g_printerr("Failed to sync new audio el. state with parent!\n");
+            goto exit;
+        }
+        // now link decodebin -> resample && capsfilter -> mixer
+        GstPad *resample_sink_pad = gst_element_get_static_pad (audio_resample, "sink");
+        GstPadLinkReturn ret = gst_pad_link(new_pad, resample_sink_pad);
+        gst_object_unref(resample_sink_pad);
+        if (GST_PAD_LINK_FAILED(ret)) {
+            g_printerr("Failed to link decodebin and resampler\n");
+            goto exit;
+        }
+        GstPad *caps_filter_src_pad = gst_element_get_static_pad (audio_capsfilter, "src");
+        ret = gst_pad_link(caps_filter_src_pad, audio_mixer_sink_pad);
+        gst_object_unref(caps_filter_src_pad);
+        if (GST_PAD_LINK_FAILED(ret)) {
+            g_printerr("Failed to link capsfilter and mixer\n");
+            goto exit;
+        }
+    } else {
+        // pass through link directly to mixer
+        GstPadLinkReturn ret = gst_pad_link(new_pad, audio_mixer_sink_pad);
+        if (GST_PAD_LINK_FAILED(ret)) {
+            g_print("Failed to link decodebin to audio mixer");
+            goto exit;
+        }
+    }
+    self->linked_audio_pads++;
+    exit:
+    if (new_pad_caps) {
+        gst_caps_unref(new_pad_caps);
+    }
+    if (audio_mixer_sink_pad) {
+        gst_object_unref(audio_mixer_sink_pad);
+    }
     return TRUE;
 }
