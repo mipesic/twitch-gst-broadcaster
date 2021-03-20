@@ -48,20 +48,24 @@ typedef struct broadcaster_impl {
     // private data
     int linked_pads;
     int linked_audio_pads;
+    gboolean initialized;
     GMutex lock;
 
 } broadcaster_impl;
 
+
+//----------------------------------------------------------------------------------------
 // Callbacks
 static void pad_added_handler(GstElement *src, GstPad *new_pad, broadcaster_impl *data);
 
+//-----------------------------------------------------------------------------------------
 // Helper functions (added not as much for re-usability as for making the code more readable
 
 // Creates all pipeline elements and configures them
-gboolean twitch_broadcaster_create_elements(twitch_broadcaster *self, Config *config);
+gboolean twitch_broadcaster_create_elements(broadcaster_impl *self, Config *config);
 
 // Add all created elements to the pipeline and links static part of the pipeline
-gboolean twitch_broadcaster_configure_pipeline(twitch_broadcaster *self, Config *config);
+gboolean twitch_broadcaster_configure_pipeline(broadcaster_impl *self);
 
 // Wires new video track into the pipeline dynamically
 gboolean twitch_broadcaster_wire_new_video_track(broadcaster_impl *self, GstPad *new_pad);
@@ -70,6 +74,7 @@ gboolean twitch_broadcaster_wire_new_video_track(broadcaster_impl *self, GstPad 
 gboolean twitch_broadcaster_wire_new_audio_track(broadcaster_impl *self, GstPad *new_pad);
 
 
+//----------------------------------------------------------------------------------------
 // API implementation
 
 twitch_broadcaster* twitch_broadcaster_new() {
@@ -79,16 +84,15 @@ twitch_broadcaster* twitch_broadcaster_new() {
 }
 
 int twitch_broadcaster_init(twitch_broadcaster *self, Config *config) {
-
     g_mutex_init(&self->impl->lock);
-
-    if (!twitch_broadcaster_create_elements(self, config)) {
+    g_return_val_if_fail(self && config->source1 && config->source2 && config->source3, -1);
+    if (!twitch_broadcaster_create_elements(self->impl, config)) {
         return -1;
     }
-    if (!twitch_broadcaster_configure_pipeline(self, config)) {
+    if (!twitch_broadcaster_configure_pipeline(self->impl)) {
         return -1;
     }
-
+    self->impl->initialized = TRUE;
     return 0;
 }
 
@@ -98,6 +102,7 @@ int twitch_broadcaster_run(twitch_broadcaster *self) {
     gboolean terminate = FALSE;
     int res = 0;
 
+    g_return_val_if_fail(self && self->impl->initialized, -1);
     GstStateChangeReturn ret = gst_element_set_state(self->impl->pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         g_printerr ("Unable to set the pipeline to the playing state.\n");
@@ -153,28 +158,29 @@ int twitch_broadcaster_run(twitch_broadcaster *self) {
     gst_object_unref (bus);
     gst_element_set_state (self->impl->pipeline, GST_STATE_NULL);
     gst_object_unref (self->impl->pipeline);
-    return 0;
+    return res;
 }
 
 void twitch_broadcaster_destroy(twitch_broadcaster *self) {
     if (self && self->impl) {
-        g_mutex_clear(&(self->impl->lock));
+        if (self->impl->initialized) {
+            g_mutex_clear(&(self->impl->lock));
+        }
         g_free(self->impl);
         self->impl = NULL;
     }
     g_free(self);
 }
 
-static void pad_added_handler (GstElement *src, GstPad *new_pad, broadcaster_impl *data) {
-    GstPadTemplate *audio_mixer_sink_pad_template = gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS(data->audio_mixer), "sink_%u");
+//----------------------------------------------------------------------------------------
+// Helpers && callbacks impl
 
+static void pad_added_handler (GstElement *src, GstPad *new_pad, broadcaster_impl *data) {
     GstCaps *new_pad_caps = NULL;
     GstStructure *new_pad_struct = NULL;
-    GstPad *audio_mixer_sink_pad = NULL;
     const gchar *new_pad_type = NULL;
-    GstPadLinkReturn ret;
 
-    g_print ("Received new pad '%s' from '%s':\n", GST_PAD_NAME (new_pad), GST_ELEMENT_NAME (src));
+    g_print("Received new pad '%s' from '%s':\n", GST_PAD_NAME (new_pad), GST_ELEMENT_NAME (src));
 
     new_pad_caps = gst_pad_get_current_caps (new_pad);
     new_pad_struct = gst_caps_get_structure (new_pad_caps, 0);
@@ -192,99 +198,100 @@ static void pad_added_handler (GstElement *src, GstPad *new_pad, broadcaster_imp
     }
     g_mutex_unlock(&data->lock);
 }
-// Helpers impl
 
 // Creates all static pipeline elements based on the provided config
-gboolean twitch_broadcaster_create_elements(twitch_broadcaster *self, Config *config) {
+gboolean twitch_broadcaster_create_elements(broadcaster_impl *self, Config *config) {
     GstCaps *caps = NULL;
+    g_return_val_if_fail(self && config->source1 && config->source2 && config->source3, FALSE);
+    self->source = gst_element_factory_make("uridecodebin", "source");
+    self->source1 = gst_element_factory_make("uridecodebin", "source1");
+    self->source2 = gst_element_factory_make("uridecodebin", "source2");
 
-    self->impl->source = gst_element_factory_make("uridecodebin", "source");
-    self->impl->source1 = gst_element_factory_make("uridecodebin", "source1");
-    self->impl->source2 = gst_element_factory_make("uridecodebin", "source2");
-
-    self->impl->video_mixer = gst_element_factory_make("compositor", "video_mixer");
-    self->impl->audio_mixer = gst_element_factory_make("audiomixer", "audio_mixer");
-    self->impl->video_capsfilter = gst_element_factory_make("capsfilter","video_mixer_capsfilter");
+    self->video_mixer = gst_element_factory_make("compositor", "video_mixer");
+    self->audio_mixer = gst_element_factory_make("audiomixer", "audio_mixer");
+    self->video_capsfilter = gst_element_factory_make("capsfilter","video_mixer_capsfilter");
     caps = gst_caps_from_string(VIDEO_CAPS);
-    g_object_set (self->impl->video_capsfilter, "caps", caps, NULL);
+    g_object_set (self->video_capsfilter, "caps", caps, NULL);
     gst_caps_unref(caps);
 
-    self->impl->x264_encoder = gst_element_factory_make("x264enc", "video-enc-1");
-    self->impl->aac_encoder = gst_element_factory_make("avenc_aac", "aac_encoder");
+    self->x264_encoder = gst_element_factory_make("x264enc", "video-enc-1");
+    self->aac_encoder = gst_element_factory_make("avenc_aac", "aac_encoder");
 
-    self->impl->flv_muxer = gst_element_factory_make("flvmux", "muxer");
-    self->impl->queue = gst_element_factory_make("queue", "buffer");
+    self->flv_muxer = gst_element_factory_make("flvmux", "muxer");
+    self->queue = gst_element_factory_make("queue", "buffer");
 
     if (config->file_sink) {
-        self->impl->sink = gst_element_factory_make("filesink", "file-sink");
-        g_object_set(self->impl->sink, "location", config->file_sink, NULL);
+        self->sink = gst_element_factory_make("filesink", "file-sink");
+        g_object_set(self->sink, "location", config->file_sink, NULL);
     } else {
-        self->impl->sink = gst_element_factory_make("rtmpsink", "rtmp-sink");
-        g_object_set(self->impl->sink, "location", "rtmp://127.0.0.1/live live=true", NULL);
+        self->sink = gst_element_factory_make("rtmpsink", "rtmp-sink");
+        g_object_set(self->sink, "location", config->rtmp_address, NULL);
     }
 
-    self->impl->pipeline = gst_pipeline_new("test-pipeline");
-    if (!self->impl->pipeline || !self->impl->source || !self->impl->source1 || !self->impl->source2 || !self->impl->video_mixer
-        || !self->impl->video_capsfilter || !self->impl->x264_encoder || !self->impl->flv_muxer
-        || !self->impl->queue || !self->impl->sink || !self->impl->aac_encoder || !self->impl->audio_mixer) {
+    self->pipeline = gst_pipeline_new("test-pipeline");
+    if (!self->pipeline || !self->source || !self->source1 || !self->source2 || !self->video_mixer
+        || !self->video_capsfilter || !self->x264_encoder || !self->flv_muxer
+        || !self->queue || !self->sink || !self->aac_encoder || !self->audio_mixer) {
         g_printerr ("Not all elements could be created.\n");
         return FALSE;
     }
-    g_object_set(self->impl->source, "uri", config->source1, NULL);
-    g_object_set(self->impl->source1, "uri", config->source2, NULL);
-    g_object_set(self->impl->source2, "uri", config->source3, NULL);
+    g_object_set(self->source, "uri", config->source1, NULL);
+    g_object_set(self->source1, "uri", config->source2, NULL);
+    g_object_set(self->source2, "uri", config->source3, NULL);
     //Black background
-    g_object_set (self->impl->video_mixer, "background", 1, NULL);
+    g_object_set (self->video_mixer, "background", 1, NULL);
     // Decouple rtmpsink from the rest of the pipeline
-    g_object_set(self->impl->queue, "max-size-time", 5 * GST_SECOND, NULL);
+    g_object_set(self->queue, "max-size-time", 5 * GST_SECOND, NULL);
     return TRUE;
 }
 
 // Adds created elements to the pipeline and links them. To be called once after
 // twitch_broadcaster_create_elements
-gboolean twitch_broadcaster_configure_pipeline(twitch_broadcaster *self, Config *config) {
+gboolean twitch_broadcaster_configure_pipeline(broadcaster_impl *self) {
+    g_return_val_if_fail(self, FALSE);
     // Add all elements to the pipeline
-    gst_bin_add_many(GST_BIN(self->impl->pipeline),
-                     self->impl->source, self->impl->source1, self->impl->source2,
-                     self->impl->video_mixer,
-                     self->impl->video_capsfilter,
-                     self->impl->audio_mixer,
-                     self->impl->x264_encoder,
-                     self->impl->aac_encoder,
-                     self->impl->flv_muxer,
-                     self->impl->queue,
-                     self->impl->sink, NULL);
+    gst_bin_add_many(GST_BIN(self->pipeline),
+                     self->source, self->source1, self->source2,
+                     self->video_mixer,
+                     self->video_capsfilter,
+                     self->audio_mixer,
+                     self->x264_encoder,
+                     self->aac_encoder,
+                     self->flv_muxer,
+                     self->queue,
+                     self->sink, NULL);
 
     // Link video chain
     if (!gst_element_link_many(
-            self->impl->video_mixer,
-            self->impl->video_capsfilter,
-            self->impl->x264_encoder,
-            self->impl->flv_muxer,
-            self->impl->queue,
-            self->impl->sink, NULL)) {
+            self->video_mixer,
+            self->video_capsfilter,
+            self->x264_encoder,
+            self->flv_muxer,
+            self->queue,
+            self->sink, NULL)) {
         g_printerr("Video elements could not be linked.\n");
-        gst_object_unref(self->impl->pipeline);
+        gst_object_unref(self->pipeline);
         return FALSE;
     }
     // Link audio chain
     if (!gst_element_link_many(
-            self->impl->audio_mixer,
-            self->impl->aac_encoder,
-            self->impl->flv_muxer,
+            self->audio_mixer,
+            self->aac_encoder,
+            self->flv_muxer,
             NULL)) {
         g_printerr("Failed to link audio branch");
-        gst_object_unref(self->impl->pipeline);
+        gst_object_unref(self->pipeline);
         return FALSE;
     }
     // Installing pad added handler to be able to reconfigure pipeline dynamically
-    g_signal_connect(self->impl->source, "pad-added", G_CALLBACK(pad_added_handler), self->impl);
-    g_signal_connect(self->impl->source1, "pad-added", G_CALLBACK(pad_added_handler), self->impl);
-    g_signal_connect(self->impl->source2, "pad-added", G_CALLBACK(pad_added_handler), self->impl);
+    g_signal_connect(self->source, "pad-added", G_CALLBACK(pad_added_handler), self);
+    g_signal_connect(self->source1, "pad-added", G_CALLBACK(pad_added_handler), self);
+    g_signal_connect(self->source2, "pad-added", G_CALLBACK(pad_added_handler), self);
     return TRUE;
 }
 
 gboolean twitch_broadcaster_wire_new_video_track(broadcaster_impl *self, GstPad *new_pad) {
+    g_return_val_if_fail(self && new_pad, FALSE);
     // Scaler to resize the signal but keep aspect ratio
     GstElement *video_scaler = NULL;
     GstElement *video_capsfilter = NULL;
@@ -384,6 +391,7 @@ gboolean twitch_broadcaster_wire_new_video_track(broadcaster_impl *self, GstPad 
 }
 
 gboolean twitch_broadcaster_wire_new_audio_track(broadcaster_impl *self, GstPad *new_pad) {
+    g_return_val_if_fail(self && new_pad, FALSE);
     GstPadTemplate *audio_mixer_sink_pad_template = gst_element_class_get_pad_template (
             GST_ELEMENT_GET_CLASS(self->audio_mixer),
             "sink_%u");

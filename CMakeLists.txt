@@ -21,4 +21,7 @@ link_directories(
 )
 
 add_executable(dyn_video_pipeline dyn_video_pipeline.c twitch_broadcaster.c)
+add_executable(dyn_video_pipeline_tests twitch_broadcaster.c twitch_broadcaster_tests.c)
+
 target_link_libraries(dyn_video_pipeline ${GSTREAMER_LIBRARIES})
+target_link_libraries(dyn_video_pipeline_tests ${GSTREAMER_LIBRARIES})

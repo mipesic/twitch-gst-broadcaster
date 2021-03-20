@@ -10,6 +10,7 @@ typedef struct {
     char *source1;
     char *source2;
     char *source3;
+    char *rtmp_address;
 } Config;
 
 typedef struct twitch_broadcaster {

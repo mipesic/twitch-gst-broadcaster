@@ -11,10 +11,11 @@ static Config config;
 
 static GOptionEntry entries[] =
 {
-        { "filesink", 'f', G_OPTION_FLAG_OPTIONAL_ARG, G_OPTION_ARG_STRING, &(config.file_sink), "Optional file sink location", "" },
+        { "filesink", 'f', G_OPTION_FLAG_OPTIONAL_ARG, G_OPTION_ARG_STRING, &(config.file_sink), "Optional file sink location, if present overwrites rtmp", "" },
         { "source1", '1', 0, G_OPTION_ARG_STRING, &(config.source1), "Source 1 location", "" },
         { "source2", '2', 0, G_OPTION_ARG_STRING, &(config.source2), "Source 2 location", "" },
         { "source3", '3', 0, G_OPTION_ARG_STRING, &(config.source3), "Source 3 location", "" },
+        { "rtmp_address", 'r', 0, G_OPTION_ARG_STRING, &(config.rtmp_address), "rtmp ddress", "" },
 };
 
 int main(int argc, char *argv[]) {
@@ -37,5 +38,4 @@ int main(int argc, char *argv[]) {
     twitch_broadcaster_run(broadcaster);
 
     twitch_broadcaster_destroy(broadcaster);
-
 }
