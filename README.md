@@ -1,5 +1,5 @@
 # Twitch broadcaster
-Proof of concept of a media pipeline which takes tree media sources, mixes their audio and video tracks and streams the content over rtmp. Could be used for [twitch broadcasting](https://help.twitch.tv/s/article/broadcast-guidelines?language=en_US).
+Proof of concept of a media pipeline which takes three media sources, mixes their audio and video tracks and streams the content over rtmp. Could be used for [twitch broadcasting](https://help.twitch.tv/s/article/broadcast-guidelines?language=en_US).
 It's using gstreamer library (1.18.4).
 
 
